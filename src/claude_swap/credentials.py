@@ -21,6 +21,7 @@ import base64
 import json
 import logging
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -72,6 +73,40 @@ _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 # short enough that a transient `security` timeout self-heals within a minute
 # instead of disabling the Keychain for the whole process lifetime.
 KEYCHAIN_RECHECK_COOLDOWN_S = 60.0
+
+# Claude Code's two environment doors onto the API-key axis, named here because
+# ``resolve_live_api_key`` has to honor them in Claude Code's own order.
+# ``ANTHROPIC_API_KEY`` counts only once the user has approved it (Claude Code
+# prompts and records ``approved_form(key)`` in ``customApiKeyResponses.approved``);
+# ``CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`` hands the key over an inherited file
+# descriptor instead of the environment, so it never appears in ``environ`` as a
+# value. ``session.AUTH_OVERRIDE_ENV_VARS`` scrubs the same pair (plus the OAuth
+# ones) from a ``cswap run`` launch; this module only *reads* them.
+API_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
+API_KEY_FD_ENV_VAR = "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"
+
+# Cap on the file-descriptor read. A key is ~110 chars; the bound exists so a
+# mis-set descriptor pointing at something enormous cannot be slurped into memory.
+API_KEY_FD_READ_LIMIT = 4096
+
+
+class LiveApiKey(NamedTuple):
+    """Which API key — if any — Claude Code would bill for the next request.
+
+    ``live`` is True whenever the API-key axis wins the precedence contest, even
+    when the key itself could not be read: an inherited file descriptor may be a
+    pipe, and consuming it would steal the key from the process it was opened
+    for. ``value`` is the key when it could be read non-destructively and ``""``
+    otherwise, so callers can distinguish "a key is live and it is *this* one"
+    from "a key is live but unidentifiable" — a distinction the slot matcher
+    needs, because the second case must never be resolved to a guessed slot.
+    ``source`` names the winning door (``env`` / ``fd`` / ``helper`` / ``login``
+    / ``none``) for logs and tests.
+    """
+
+    value: str
+    live: bool
+    source: str
 
 
 class ActiveCredentials(NamedTuple):
@@ -410,6 +445,21 @@ class CredentialStore:
         API-key account would read as an empty slot, since it is deliberately
         the *only* copy on disk.
         """
+        return self._read_login_managed_key() or self._api_key_helper.active_key()
+
+    def _read_login_managed_key(self, cfg: dict | None = None) -> str:
+        """The key Claude Code's own ``/login`` stored, or "". Non-mutating.
+
+        macOS Keychain "Claude Code" (when usable) first, then ``~/.claude.json``
+        ``primaryApiKey`` — mirroring Claude Code's
+        ``getApiKeyFromConfigOrMacOSKeychain``. The ``apiKeyHelper`` copy is
+        deliberately *not* consulted here: it is a separate, higher-precedence
+        door (see :meth:`resolve_live_api_key`), and folding it in would make the
+        two indistinguishable to a caller whose whole job is to rank them.
+
+        ``cfg`` lets a caller that has already parsed ``~/.claude.json`` hand it
+        over instead of paying for a second read.
+        """
         if self._use_keychain():
             try:
                 val = self._kc_call(
@@ -422,12 +472,113 @@ class CredentialStore:
                 val = None
             if val:
                 return val
-        cfg = self._read_global_config()
+        if cfg is None:
+            cfg = self._read_global_config()
         if cfg:
             key = cfg.get("primaryApiKey")
             if isinstance(key, str) and key:
                 return key
-        return self._api_key_helper.active_key()
+        return ""
+
+    def resolve_live_api_key(self) -> LiveApiKey:
+        """Whether an API key is the credential Claude Code would bill next.
+
+        Mirrors *Claude Code's* source precedence (verified against the 2.1.220
+        bundle), which is a different question from the one
+        :meth:`_read_active_credentials` answers ("which credential bytes does
+        cswap own here", OAuth-first because the switch and backup paths depend on
+        that order). Both must exist: reading storage cannot tell you which store
+        wins, and an API-key login does **not** clear ``oauthAccount``, so the
+        OAuth-first read happily returns a stale identity for a session that is
+        really billing a key.
+
+        Order, highest first:
+
+        1. ``ANTHROPIC_API_KEY``, but only when it is *approved* — Claude Code
+           prompts for an unrecognized key and does not use it until the user
+           says yes, so an unapproved value is not live.
+        2. ``CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`` — live by its presence; see
+           :meth:`_read_api_key_fd` for why the value may come back empty.
+        3. The ``apiKeyHelper`` hook, which outranks the claude.ai OAuth
+           credential whenever it is registered (this is why cswap toggles it per
+           switch rather than leaving it installed).
+        4. The ``/login``-managed key (macOS Keychain "Claude Code", then
+           ``primaryApiKey``).
+
+        Anything below that is claude.ai OAuth or nothing, reported as
+        ``live=False``. Non-mutating throughout.
+        """
+        cfg = self._read_global_config()
+
+        env_key = (os.environ.get(API_KEY_ENV_VAR) or "").strip()
+        if env_key and self._api_key_approved(env_key, cfg):
+            return LiveApiKey(env_key, True, "env")
+
+        fd_raw = (os.environ.get(API_KEY_FD_ENV_VAR) or "").strip()
+        if fd_raw:
+            return LiveApiKey(self._read_api_key_fd(fd_raw), True, "fd")
+
+        helper_key = self._api_key_helper.active_key().strip()
+        if helper_key:
+            return LiveApiKey(helper_key, True, "helper")
+
+        login_key = self._read_login_managed_key(cfg).strip()
+        if login_key:
+            return LiveApiKey(login_key, True, "login")
+
+        return LiveApiKey("", False, "none")
+
+    @staticmethod
+    def _api_key_approved(api_key: str, cfg: dict | None) -> bool:
+        """Whether ``customApiKeyResponses.approved`` records this key as approved.
+
+        Compared in ``approved_form`` (the last 20 chars), which is the only form
+        Claude Code ever writes there — comparing the full key would never match.
+        """
+        if not isinstance(cfg, dict):
+            return False
+        responses = cfg.get("customApiKeyResponses")
+        if not isinstance(responses, dict):
+            return False
+        approved = responses.get("approved")
+        if not isinstance(approved, list):
+            return False
+        return approved_form(api_key) in approved
+
+    def _read_api_key_fd(self, raw: str) -> str:
+        """Read the key behind an inherited descriptor, or "" when we must not.
+
+        Only a *regular file* is read, and only through ``os.pread`` at offset 0,
+        which leaves the descriptor's own offset untouched. A pipe or socket is
+        left strictly alone: a read there consumes bytes the process the
+        descriptor was opened for is waiting on, so identifying the key is not
+        worth stealing it.
+
+        Returning ``""`` does not downgrade the verdict — the caller still reports
+        the API-key axis as live, and a live-but-unidentified key resolves to no
+        slot rather than a guessed one. Which is also the whole story on Windows,
+        where ``os.pread`` does not exist: there is no non-destructive read to
+        make, so the key stays unidentified rather than consumed.
+        """
+        if not hasattr(os, "pread"):
+            return ""
+        try:
+            fd = int(raw)
+        except ValueError:
+            return ""
+        if fd < 0:
+            return ""
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return ""
+            return os.pread(fd, API_KEY_FD_READ_LIMIT, 0).decode("utf-8").strip()
+        except (OSError, ValueError, UnicodeDecodeError) as e:
+            self._host._logger.debug(
+                f"Could not read {API_KEY_FD_ENV_VAR}={raw} non-destructively ({e}); "
+                "treating the live API key as unidentified"
+            )
+            return ""
+
 
     def _read_global_config(self) -> dict | None:
         """Read and parse ``~/.claude.json``, or None when absent/unreadable."""

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -384,6 +385,333 @@ class TestExportImport:
             import_accounts(dst, str(out))
             assert dst._account_kind("1") == "api_key"
             assert dst._read_account_credentials("1", "api-key-1@token.local") == API_KEY
+
+
+# ---------------------------------------------------------------------------
+# Live-credential resolution: WHICH key is live, and which slot is it
+# ---------------------------------------------------------------------------
+
+# Distinct keys, one per door, so a precedence assertion names the winner rather
+# than merely proving "some key came back".
+ENV_KEY = "sk-ant-api03-" + "e0e0e0e0e0" * 4
+FD_KEY = "sk-ant-api03-" + "f1f1f1f1f1" * 4
+HELPER_KEY = "sk-ant-api03-" + "h2h2h2h2h2" * 4
+LOGIN_KEY = "sk-ant-api03-" + "l3l3l3l3l3" * 4
+
+# An OAuth identity matching no managed slot. This is the state a key login
+# leaves behind: ``/login`` with an ``sk-ant-api…`` key does not clear
+# ``oauthAccount``, and a running Claude Code rewrites that block on every
+# re-login — so the identity there drifts to whichever account touched it last.
+STALE_OAUTH = {
+    "emailAddress": "someone-else@example.com",
+    "organizationUuid": "org-uuid-matching-no-slot",
+}
+
+
+def _arm_helper(api_key: str) -> None:
+    """Register the ``apiKeyHelper`` hook on ``api_key``, as a switch would."""
+    assert _helper().install(api_key) is True
+
+
+def _write_global_config(**keys) -> None:
+    get_global_config_path().write_text(json.dumps(keys), encoding="utf-8")
+
+
+def _key_slot_switcher(live_config: dict) -> ClaudeAccountSwitcher:
+    """One API-key slot, plus a stale ``oauthAccount`` over ``live_config``.
+
+    ``live_config`` supplies the API-key door under test (e.g.
+    ``{"primaryApiKey": …}``). ``activeAccountNumber`` is pinned to the slot on
+    purpose: the resolver must never *use* it, so the tests that expect ``None``
+    have to be able to fail if it ever became a fallback.
+    """
+    s = _linux_switcher()
+    s.add_account_from_token(API_KEY)
+    data = s._get_sequence_data()
+    data["activeAccountNumber"] = 1
+    s._write_json(s.sequence_file, data)
+    _write_global_config(oauthAccount=STALE_OAUTH, **live_config)
+    return s
+
+
+class TestLiveApiKeySlotDetection:
+    """An API-key login is resolved by its KEY, never by ``oauthAccount``.
+
+    Reading ``oauthAccount`` alone is what made ``cswap status`` print
+    ``(not managed)`` for a slot cswap owns, and made the auto engine burn ticks
+    on ``unmanaged-active-account`` while an API-key slot was live.
+    """
+
+    def test_live_key_resolves_its_own_slot(self, temp_home: Path):
+        s = _key_slot_switcher({"primaryApiKey": API_KEY})
+        assert s.current_account_number() == "1"
+        assert s.has_live_login() is True
+
+    def test_live_key_matching_no_slot_is_none_not_a_guess(self, temp_home: Path):
+        """The invariant ``current_account_number`` exists to protect.
+
+        A slot returned here would be evaluated for usage and then switched onto
+        by ``_perform_switch``'s no-backup direct-activation path — overwriting a
+        login cswap does not own. ``activeAccountNumber`` says 1 and the OAuth
+        block names an account; neither may stand in for a key match.
+        """
+        s = _key_slot_switcher({"primaryApiKey": OTHER_KEY})
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        assert s.current_account_number() is None
+        # It is still a live login, so the engine says "unmanaged", not "absent".
+        assert s.has_live_login() is True
+
+    def test_truncated_key_is_a_miss(self, temp_home: Path):
+        """No prefix or partial credit — a near-miss key is an unmanaged login."""
+        s = _key_slot_switcher({"primaryApiKey": API_KEY[:-4]})
+        assert s.current_account_number() is None
+
+    def test_oauth_slot_is_never_matched_by_a_key(self, temp_home: Path):
+        s = _linux_switcher()
+        s.add_account_from_token("sk-ant-oat01-abc", email="me@example.com")
+        _write_global_config(oauthAccount=STALE_OAUTH, primaryApiKey=API_KEY)
+        assert s.current_account_number() is None
+
+    def test_oauth_login_matching_a_slot_is_unchanged(self, temp_home: Path):
+        s = _linux_switcher()
+        s.add_account_from_token("sk-ant-oat01-abc", email="me@example.com")
+        _write_global_config(oauthAccount={"emailAddress": "me@example.com"})
+        assert s.current_account_number() == "1"
+        assert s.has_live_login() is True
+
+    def test_unmanaged_oauth_login_is_unchanged(self, temp_home: Path):
+        s = _linux_switcher()
+        s.add_account_from_token(API_KEY)
+        _write_global_config(oauthAccount=STALE_OAUTH)
+        assert s.current_account_number() is None
+        assert s.has_live_login() is True
+
+    def test_no_credential_anywhere_has_no_live_login(self, temp_home: Path):
+        s = _linux_switcher()
+        s.add_account_from_token(API_KEY)
+        _write_global_config()
+        assert s.current_account_number() is None
+        assert s.has_live_login() is False
+
+    def test_helper_held_key_resolves_its_slot(self, temp_home: Path):
+        """The live-switch channel is where an activated key actually lives.
+
+        ``_write_credentials`` stores the key ONLY in the helper key file, so a
+        resolver that reads ``primaryApiKey`` alone sees nothing at all on the
+        machine state cswap itself produces.
+        """
+        s = _key_slot_switcher({})
+        _arm_helper(API_KEY)
+        assert s.current_account_number() == "1"
+
+
+class TestLiveApiKeyPrecedence:
+    """Claude Code's own resolution order, honored exactly.
+
+    ``ANTHROPIC_API_KEY`` (approved only) -> key file descriptor -> apiKeyHelper
+    -> the ``/login``-managed key -> claude.ai OAuth -> none. Each test arms every
+    door *below* the one under test, so a wrong order fails rather than passing on
+    an empty lower door.
+    """
+
+    def test_approved_env_key_outranks_every_other_door(
+        self, temp_home: Path, monkeypatch
+    ):
+        s = _linux_switcher()
+        _arm_helper(HELPER_KEY)
+        _write_global_config(
+            primaryApiKey=LOGIN_KEY,
+            customApiKeyResponses={"approved": [approved_form(ENV_KEY)]},
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", ENV_KEY)
+        assert s._resolve_live_api_key() == (ENV_KEY, True, "env")
+
+    def test_unapproved_env_key_is_not_live(self, temp_home: Path, monkeypatch):
+        """Claude Code prompts for an unrecognized key and does not use it.
+
+        So an unapproved value must fall through — the ``/login`` key below is
+        still what gets billed.
+        """
+        s = _linux_switcher()
+        _write_global_config(primaryApiKey=LOGIN_KEY)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", ENV_KEY)
+        assert s._resolve_live_api_key() == (LOGIN_KEY, True, "login")
+
+    def test_unapproved_env_key_leaves_the_oauth_login_live(
+        self, temp_home: Path, monkeypatch
+    ):
+        s = _linux_switcher()
+        s.add_account_from_token("sk-ant-oat01-abc", email="me@example.com")
+        _write_global_config(oauthAccount={"emailAddress": "me@example.com"})
+        monkeypatch.setenv("ANTHROPIC_API_KEY", ENV_KEY)
+        assert s._resolve_live_api_key() == ("", False, "none")
+        assert s.current_account_number() == "1"
+
+    def test_env_key_approved_under_a_different_key_is_not_live(
+        self, temp_home: Path, monkeypatch
+    ):
+        """``approved`` holds ``key[-20:]``; another key's entry must not count."""
+        s = _linux_switcher()
+        _write_global_config(
+            primaryApiKey=LOGIN_KEY,
+            customApiKeyResponses={"approved": [approved_form(LOGIN_KEY)]},
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", ENV_KEY)
+        assert s._resolve_live_api_key() == (LOGIN_KEY, True, "login")
+
+    @pytest.mark.skipif(
+        not hasattr(os, "pread"),
+        reason="no os.pread on Windows, so a descriptor is never read there",
+    )
+    def test_descriptor_outranks_helper_and_login_key(
+        self, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        s = _linux_switcher()
+        _arm_helper(HELPER_KEY)
+        _write_global_config(primaryApiKey=LOGIN_KEY)
+        key_file = tmp_path / "fd-key"
+        key_file.write_text(FD_KEY + "\n", encoding="utf-8")
+        fd = os.open(str(key_file), os.O_RDONLY)
+        try:
+            monkeypatch.setenv("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", str(fd))
+            assert s._resolve_live_api_key() == (FD_KEY, True, "fd")
+            # pread, not read: the descriptor's owner must still see byte 0.
+            assert os.lseek(fd, 0, os.SEEK_CUR) == 0
+        finally:
+            os.close(fd)
+
+    def test_unreadable_descriptor_is_live_but_unidentified(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A pipe is left alone: reading it would steal the owner's key.
+
+        Live-but-unidentified, so no slot is resolved and nothing is consumed.
+        """
+        s = _linux_switcher()
+        _write_global_config(primaryApiKey=LOGIN_KEY)
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, FD_KEY.encode("utf-8"))
+            monkeypatch.setenv("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", str(read_fd))
+            assert s._resolve_live_api_key() == ("", True, "fd")
+            assert s.current_account_number() is None
+            assert s.has_live_login() is True
+            # Every byte the owner is waiting on is still in the pipe.
+            assert os.read(read_fd, 4096).decode("utf-8") == FD_KEY
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_garbage_descriptor_is_live_but_unidentified(
+        self, temp_home: Path, monkeypatch
+    ):
+        s = _linux_switcher()
+        _write_global_config(primaryApiKey=LOGIN_KEY)
+        monkeypatch.setenv("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "not-a-number")
+        assert s._resolve_live_api_key() == ("", True, "fd")
+
+    def test_helper_outranks_the_login_key(self, temp_home: Path):
+        s = _linux_switcher()
+        _arm_helper(HELPER_KEY)
+        _write_global_config(primaryApiKey=LOGIN_KEY)
+        assert s._resolve_live_api_key() == (HELPER_KEY, True, "helper")
+
+    def test_foreign_helper_does_not_supply_a_key(self, temp_home: Path):
+        """Someone else's ``apiKeyHelper`` is not ours to read a key out of."""
+        s = _linux_switcher()
+        settings = _helper().settings_path
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(
+            json.dumps({"apiKeyHelper": "/opt/mine/print-key.sh"}), encoding="utf-8"
+        )
+        _write_global_config(primaryApiKey=LOGIN_KEY)
+        assert s._resolve_live_api_key() == (LOGIN_KEY, True, "login")
+
+    def test_login_key_when_no_higher_door_is_armed(self, temp_home: Path):
+        s = _linux_switcher()
+        _write_global_config(primaryApiKey=LOGIN_KEY)
+        assert s._resolve_live_api_key() == (LOGIN_KEY, True, "login")
+
+    def test_oauth_only_is_not_a_live_key(self, temp_home: Path):
+        s = _linux_switcher()
+        cred_file = get_credentials_path()
+        cred_file.parent.mkdir(parents=True, exist_ok=True)
+        cred_file.write_text(OAUTH_JSON, encoding="utf-8")
+        _write_global_config(oauthAccount={"emailAddress": "me@example.com"})
+        assert s._resolve_live_api_key() == ("", False, "none")
+
+    def test_macos_managed_keychain_is_the_login_door(
+        self, temp_home: Path, block_real_keychain
+    ):
+        store = block_real_keychain
+        s = _macos_switcher()
+        store.set_password(
+            CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
+            macos_keychain.keychain_account_name(),
+            LOGIN_KEY,
+        )
+        assert s._resolve_live_api_key() == (LOGIN_KEY, True, "login")
+
+
+class TestStatusAndListWithLiveApiKey:
+    """``status`` / ``list`` name the API-key slot instead of ``(not managed)``."""
+
+    def test_status_names_the_slot(self, temp_home: Path, capsys):
+        s = _key_slot_switcher({"primaryApiKey": API_KEY})
+        s.status()
+        out = capsys.readouterr().out
+        assert "Account-1" in out
+        assert "api-key-1@token.local" in out
+        assert "not managed" not in out
+
+    def test_list_marks_the_slot_active(self, temp_home: Path, capsys):
+        s = _key_slot_switcher({"primaryApiKey": API_KEY})
+        s.list_accounts()
+        out = capsys.readouterr().out
+        assert "1: api-key-1@token.local" in out
+        assert "(active)" in out
+
+    def test_status_json_reports_it_managed(self, temp_home: Path):
+        s = _key_slot_switcher({"primaryApiKey": API_KEY})
+        payload = s.status(json_output=True)
+        assert payload["active"]["managed"] is True
+        assert payload["active"]["number"] == 1
+        assert payload["active"]["usageStatus"] == "api_key"
+
+    def test_active_slot_is_attributed_to_the_key_not_a_stale_oauth_blob(
+        self, temp_home: Path
+    ):
+        """Usage must read "API key", not a subscription's numbers.
+
+        A key login leaves an OAuth credential on disk. Reading the *store*
+        (OAuth-first, by design, for the switch paths) would hand the active row
+        another account's token and fetch its quota for a slot billing per token.
+        """
+        s = _key_slot_switcher({"primaryApiKey": API_KEY})
+        cred_file = get_credentials_path()
+        cred_file.parent.mkdir(parents=True, exist_ok=True)
+        cred_file.write_text(OAUTH_JSON, encoding="utf-8")
+
+        num, _email, _org_name, _org_uuid, is_active, creds, _alias = (
+            s._build_accounts_info()[0]
+        )
+        assert (num, is_active) == (1, True)
+        assert creds == API_KEY
+        assert s._collect_usage_entries(s._build_accounts_info())["1"].sentinel == (
+            USAGE_API_KEY
+        )
+
+    def test_unmanaged_live_key_is_reported_without_leaking_it(
+        self, temp_home: Path, capsys
+    ):
+        s = _key_slot_switcher({"primaryApiKey": OTHER_KEY})
+        s.status()
+        out = capsys.readouterr().out
+        assert "not managed" in out
+        assert OTHER_KEY not in out
+        assert approved_form(OTHER_KEY) not in out
+        # ...and the stale OAuth identity is not passed off as the live one.
+        assert STALE_OAUTH["emailAddress"] not in out
 
 
 class _patched_home:

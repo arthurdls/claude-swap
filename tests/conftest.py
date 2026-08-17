@@ -98,6 +98,13 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     """
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    # Claude Code's env doors onto the API-key axis. A developer with either
+    # exported would otherwise have the live-credential resolver
+    # (``credentials.resolve_live_api_key``) report *their* key as live inside
+    # every test — the descriptor one unconditionally, since its presence alone
+    # decides. Tests that exercise those vars set them explicitly, overriding this.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", raising=False)
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
     if "tmp_keychain" in request.fixturenames:

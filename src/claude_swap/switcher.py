@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -41,6 +42,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     SECURITY_SERVICE,
     ActiveCredentials,
     CredentialStore,
+    LiveApiKey,
     looks_like_api_key,
     merge_shared_credential_fields,
     shared_credential_fields,
@@ -97,6 +99,16 @@ KEYRING_SERVICE = "claude-code"
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
 # on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
 SETUP_TOKEN_SCOPES = ("user:inference",)
+
+# Display identity for a live API key that matches no managed slot. It stands in
+# the (email, organizationUuid) position, so it is chosen to be unmatchable: a
+# slot email is always either a real address or a synthesized
+# ``…@token.local``, never a parenthesized phrase. That is load-bearing —
+# ``current_account_number`` must resolve it to ``None`` rather than a guess. The
+# key itself is deliberately absent from the label: an unmanaged key is nothing
+# cswap can act on, and echoing even part of it into terminal scrollback and JSON
+# output buys nothing.
+UNMANAGED_API_KEY_LABEL = "API key (unmanaged)"
 
 # Delay between successive usage-request launches in one collect pass, so N
 # accounts never burst the shared usage endpoint from one IP in the same
@@ -431,6 +443,30 @@ class ClaudeAccountSwitcher:
 
     def _read_active_credentials(self) -> ActiveCredentials:
         return self._store._read_active_credentials()
+
+    def _read_live_credentials(self) -> ActiveCredentials:
+        """The live credential resolved on *Claude Code's* precedence, for display.
+
+        Use this wherever the question is "what is this machine billing right now"
+        — status, the account list, usage attribution.
+        :meth:`_read_active_credentials` stays the read for the switch and backup
+        paths, whose OAuth-first order is load-bearing (a macOS OAuth login with
+        only a file fallback must never be misread as an API key).
+
+        Composed here rather than pushed into the store so the API-key axis layers
+        *over* this class's own OAuth read, which is the one seam the rest of the
+        switcher already goes through. A live-but-unidentified key reports ``""``
+        instead of falling through to the OAuth store: the OAuth blob on disk is
+        not what is being billed, and returning it would attribute the spend to
+        the wrong account.
+        """
+        resolved = self._resolve_live_api_key()
+        if resolved.live:
+            return ActiveCredentials(resolved.value, False)
+        return self._read_active_credentials()
+
+    def _resolve_live_api_key(self) -> LiveApiKey:
+        return self._store.resolve_live_api_key()
 
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
@@ -1545,14 +1581,20 @@ class ClaudeAccountSwitcher:
     def current_account_number(self) -> str | None:
         """Slot of the live login; ``None`` when there is none or it's unmanaged.
 
+        Resolves through :meth:`_live_identity`, so an API-key login is matched by
+        its *key* against the managed slots rather than by the stale
+        ``oauthAccount`` block a key login leaves behind.
+
         Deliberately no fallback to the recorded ``activeAccountNumber``: an
         unmanaged live login must return ``None`` — never a guessed slot — so
         the auto-switch engine can't evaluate the wrong account's usage and
         overwrite a login cswap doesn't own (``_perform_switch`` would take
-        the no-backup direct-activation path). Use :meth:`has_live_login` to
-        tell the two ``None`` cases apart.
+        the no-backup direct-activation path). That holds for the API-key axis
+        too: a live key matching no slot is ``None``, and only an exact match on
+        stored key bytes ever returns one. Use :meth:`has_live_login` to tell the
+        two ``None`` cases apart.
         """
-        identity = self._get_current_account()
+        identity = self._live_identity()
         if identity is None:
             return None
         data = self._get_sequence_data() or {}
@@ -1560,8 +1602,17 @@ class ClaudeAccountSwitcher:
         return self._find_account_slot(data, email, org_uuid)
 
     def has_live_login(self) -> bool:
-        """Whether ``~/.claude.json`` carries any live account identity."""
-        return self._get_current_account() is not None
+        """Whether Claude Code has any live credential at all.
+
+        An API-key login counts, which is what keeps it consistent with
+        :meth:`current_account_number`: the pair exists so a ``None`` slot can be
+        read as "unmanaged login, do not touch it" instead of "nobody is logged
+        in", and a live key cswap cannot attribute is exactly that case. The
+        autoswitch engine takes no action either way; saying so truthfully is the
+        difference between its ``unmanaged-active-account`` and
+        ``no-active-account`` reasons.
+        """
+        return self._live_identity() is not None
 
     def live_session_pids_for(self, account_num: str, email: str) -> list[int]:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
@@ -1732,7 +1783,13 @@ class ClaudeAccountSwitcher:
         return max(account_nums, default=0) + 1
 
     def _get_current_account(self) -> tuple[str, str] | None:
-        """Get current account identity (email, organization_uuid) from .claude.json.
+        """Get the OAuth account identity (email, organization_uuid) from .claude.json.
+
+        The ``oauthAccount`` block and nothing else — which makes it the *claude.ai
+        OAuth* identity, not necessarily the live one: a ``/login`` with an
+        ``sk-ant-api…`` key leaves this block exactly as it was. Callers deciding
+        which account is live want :meth:`_live_identity`; this stays the read for
+        the switch, capture and transfer paths, which are about the OAuth store.
 
         Returns:
             (email, organization_uuid) tuple if found, None otherwise.
@@ -1764,6 +1821,74 @@ class ClaudeAccountSwitcher:
                     account.get("organizationUuid", "") == organization_uuid):
                 return num
         return None
+
+    def _find_api_key_slot(self, api_key: str) -> str | None:
+        """Slot whose stored key *is* ``api_key``, else ``None``.
+
+        Only ``kind == "api_key"`` slots are considered — every other slot's
+        backup is an OAuth JSON blob that could not match a bare key anyway, and
+        skipping them avoids decrypting credentials this question has no business
+        touching. The comparison is constant-time over copies held only in memory:
+        the key is never logged, printed or written by this path, and no partial
+        or prefix match is accepted, so a re-rolled key that shares a prefix with
+        a stored one is a miss rather than a wrong slot. Compared as *bytes*
+        because ``compare_digest`` raises on a non-ASCII ``str``, and a corrupt
+        backup must be a miss rather than an exception out of a status read.
+        """
+        candidate = api_key.strip().encode("utf-8")
+        if not candidate:
+            return None
+        data = self._get_sequence_data() or {}
+        for num, account in data.get("accounts", {}).items():
+            if account.get("kind") != "api_key":
+                continue
+            stored = self._read_account_credentials(
+                str(num), account.get("email", "")
+            ).strip().encode("utf-8")
+            if stored and hmac.compare_digest(stored, candidate):
+                return str(num)
+        return None
+
+    def _live_api_key_slot(self) -> tuple[str | None, bool]:
+        """``(slot, api_key_is_live)`` for the API-key axis.
+
+        ``slot`` is a managed slot number only when the live key is byte-equal to
+        that slot's stored key. A live key matching nothing — including one behind
+        a descriptor we refused to consume — returns ``(None, True)``, so a caller
+        can say "live, and cswap does not own it" without ever guessing a slot.
+        """
+        resolved = self._resolve_live_api_key()
+        if not resolved.live:
+            return None, False
+        if not resolved.value:
+            return None, True
+        return self._find_api_key_slot(resolved.value), True
+
+    def _live_identity(self) -> tuple[str, str] | None:
+        """``(email, organizationUuid)`` of the credential Claude Code is billing.
+
+        The API-key axis is consulted first because it *outranks* the claude.ai
+        OAuth credential in Claude Code's own resolution, and because an API-key
+        login does not clear ``oauthAccount``. Reading that block alone therefore
+        reports a stale OAuth identity for a machine that is really billing a key —
+        which is either the wrong account or, when the stale identity matches no
+        slot, ``(not managed)`` for an account cswap manages perfectly well.
+
+        A live key that matches a managed slot resolves to that slot's own stored
+        identity, so ``_find_account_slot`` lands on it exactly as it would for an
+        OAuth login and every (email, org) consumer needs no further change. A live
+        key that matches nothing resolves to :data:`UNMANAGED_API_KEY_LABEL`, which
+        matches no slot by construction — the caller must see "there is a live
+        login and it is unmanaged", never a guessed slot. With no key live, the
+        OAuth identity is returned verbatim.
+        """
+        slot, api_key_live = self._live_api_key_slot()
+        if not api_key_live:
+            return self._get_current_account()
+        if slot is None:
+            return (UNMANAGED_API_KEY_LABEL, "")
+        identity = self.account_identity(slot)
+        return (identity["email"], identity["organizationUuid"])
 
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
         """Check if account exists by (email, organizationUuid) composite key."""
@@ -2518,11 +2643,13 @@ class ClaudeAccountSwitcher:
 
         Shared by list_accounts and the usage-aware switch helpers so the active
         slot is detected and credentials are read in exactly one place. The
-        active account's credentials come from Claude Code's live store; every
-        other slot reads its backup copy.
+        active account's credentials come from Claude Code's live store, resolved
+        on Claude Code's own precedence (:meth:`_read_live_credentials`) so an
+        API-key login is attributed to the key it is billing rather than to the
+        OAuth blob still sitting on disk; every other slot reads its backup copy.
         """
         data = self._get_sequence_data_migrated() or {}
-        current_identity = self._get_current_account()
+        current_identity = self._live_identity()
 
         # Find active account number by (email, organizationUuid) composite key
         active_num = None
@@ -2544,7 +2671,7 @@ class ClaudeAccountSwitcher:
             is_active = str(num) == active_num
 
             if is_active:
-                active = self._read_active_credentials()
+                active = self._read_live_credentials()
                 creds = active.value or ""
                 self._active_keychain_unavailable = active.keychain_unavailable
             else:
@@ -3380,7 +3507,7 @@ class ClaudeAccountSwitcher:
         collector, so freshness/backoff/claim gating and the shared
         ``cache/usage.json`` table behave exactly as in ``--list``.
         """
-        active = self._read_active_credentials()
+        active = self._read_live_credentials()
         creds = active.value or ""
         self._active_keychain_unavailable = active.keychain_unavailable
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
@@ -3388,7 +3515,7 @@ class ClaudeAccountSwitcher:
 
     def _build_status_payload(self) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
-        identity = self._get_current_account()
+        identity = self._live_identity()
         if identity is None:
             return {"schemaVersion": SCHEMA_VERSION, "active": None}
         current_email, current_org_uuid = identity
@@ -3440,7 +3567,7 @@ class ClaudeAccountSwitcher:
         if json_output:
             return self._build_status_payload()
 
-        identity = self._get_current_account()
+        identity = self._live_identity()
         if identity is None:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
             return None
