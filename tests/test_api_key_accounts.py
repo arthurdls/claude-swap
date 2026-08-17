@@ -617,10 +617,16 @@ class TestLiveApiKeyPrecedence:
         assert s._resolve_live_api_key() == (HELPER_KEY, True, "helper")
 
     def test_foreign_helper_does_not_supply_a_key(self, temp_home: Path):
-        """Someone else's ``apiKeyHelper`` is not ours to read a key out of."""
+        """A key file left behind by an older cswap is not what Claude Code reads.
+
+        Ownership is decided by ``settings.json``, not by the key file existing —
+        so the leftover file below must be ignored while a foreign helper holds
+        the hook, and the ``/login`` key is what is really live.
+        """
         s = _linux_switcher()
+        _arm_helper(HELPER_KEY)
+        assert _helper().key_path.exists()
         settings = _helper().settings_path
-        settings.parent.mkdir(parents=True, exist_ok=True)
         settings.write_text(
             json.dumps({"apiKeyHelper": "/opt/mine/print-key.sh"}), encoding="utf-8"
         )
