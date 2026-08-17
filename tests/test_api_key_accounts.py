@@ -466,11 +466,29 @@ class TestLiveApiKeySlotDetection:
         s = _key_slot_switcher({"primaryApiKey": API_KEY[:-4]})
         assert s.current_account_number() is None
 
-    def test_oauth_slot_is_never_matched_by_a_key(self, temp_home: Path):
+    def test_kindless_slot_holding_the_live_key_is_not_matched(self, temp_home: Path):
+        """Only a slot that *declares* ``kind == "api_key"`` may be resolved.
+
+        A slot with no ``kind`` reads as OAuth everywhere else in the class
+        (``_account_kind``'s back-compat default, which the session guard, export
+        and cross-kind collision checks all key off), and only a pre-``kind``
+        install could have stored a raw key on one. Matching it here would report
+        a slot the rest of cswap treats as OAuth as a live API-key account — so it
+        is a miss even though its stored bytes *are* the live key. The safe
+        failure: "unmanaged" blocks a switch, a wrong slot invites one. Re-adding
+        it with ``cswap add-token`` is the fix, not a looser match here.
+        """
         s = _linux_switcher()
-        s.add_account_from_token("sk-ant-oat01-abc", email="me@example.com")
+        s.add_account_from_token(API_KEY)
+        data = s._get_sequence_data()
+        del data["accounts"]["1"]["kind"]
+        s._write_json(s.sequence_file, data)
+        assert s._account_kind("1") == "oauth"
+        assert s._read_account_credentials("1", "api-key-1@token.local") == API_KEY
+
         _write_global_config(oauthAccount=STALE_OAUTH, primaryApiKey=API_KEY)
         assert s.current_account_number() is None
+        assert s.has_live_login() is True
 
     def test_oauth_login_matching_a_slot_is_unchanged(self, temp_home: Path):
         s = _linux_switcher()
